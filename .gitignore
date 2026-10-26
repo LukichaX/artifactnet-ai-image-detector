@@ -1,0 +1,17 @@
+# ვირტუალური გარემო და PyCharm-ის სისტემური ფაილები
+.venv/
+venv/
+.idea/
+__pycache__/
+*.py[cod]
+
+# დატასეტი (85,000+ სურათი არ უნდა აიტვირთოს GitHub-ზე)
+data/
+
+# მძიმე წონების ფაილები (>100MB), მაგრამ ვტოვებთ training_history.csv-ს!
+checkpoints/*.pth
+*.pth
+
+# დროებითი ფაილები
+.gradio/
+.DS_Store
