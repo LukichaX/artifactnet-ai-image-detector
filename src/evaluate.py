@@ -1,5 +1,11 @@
 import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from pathlib import Path
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
@@ -7,78 +13,75 @@ import pandas as pd
 import seaborn as sns
 import torch
 from sklearn.metrics import confusion_matrix, roc_curve
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-SRC_DIR = Path(__file__).resolve().parent
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from dataset import create_dataloaders, get_transforms
-from model import ArtifactNet
-from utils import compute_metrics
+from src.dataset import create_dataloaders, smash_and_reconstruct_rich_poor
+from src.model import ArtifactNetV2
+from src.utils import compute_metrics, seed_everything
 
 
-class KaggleTestDataset(Dataset):
-    """კითხულობს test.csv-ის 5,540 სურათს Kaggle-ის პროგნოზებისთვის."""
-    def __init__(self, df: pd.DataFrame, data_dir: Path, transform):
-        self.data_dir = data_dir
-        self.ids = df["id"].values
-        self.transform = transform
+@torch.no_grad()
+def predict_single_image_tta(model: torch.nn.Module, img_rgb: np.ndarray, device: torch.device) -> float:
+    """
+    Test-Time Augmentation (TTA) 1:1 პიქსელებზე:
+    ამოწმებს ორიგინალსა და ჰორიზონტალურად შებრუნებულ Rich/Poor წყვილს.
+    """
+    xr1, xp1 = smash_and_reconstruct_rich_poor(img_rgb, out_size=256, patch_size=32, is_train=False)
+    img_flip = cv2.flip(img_rgb, 1)
+    xr2, xp2 = smash_and_reconstruct_rich_poor(img_flip, out_size=256, patch_size=32, is_train=False)
 
-    def __len__(self) -> int:
-        return len(self.ids)
+    xr = torch.from_numpy(np.stack([xr1, xr2]).transpose(0, 3, 1, 2)).to(device, dtype=torch.float32) / 255.0
+    xp = torch.from_numpy(np.stack([xp1, xp2]).transpose(0, 3, 1, 2)).to(device, dtype=torch.float32) / 255.0
 
-    def __getitem__(self, idx: int):
-        rel_path = self.ids[idx]
-        img_path = str(self.data_dir / rel_path)
-        image = cv2.imread(img_path)
-        if image is None:
-            raise FileNotFoundError(f"ვერ მოიძებნა: {img_path}")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        tensor_img = self.transform(image=image)["image"]
-        return tensor_img, rel_path
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        logits = model(xr, xp)
+        probs = torch.sigmoid(logits).squeeze(1)
+    return float(probs.mean().item())
 
 
-def plot_training_history(history_csv: Path, assets_dir: Path) -> None:
-    """ხატავს სწავლების გრაფიკებს GitHub README-სთვის."""
-    if not history_csv.exists():
-        return
-    df = pd.read_csv(history_csv)
-    best_ep = int(df.loc[df["val_f1"].idxmax(), "epoch"])
+def evaluate() -> None:
+    seed_everything(42)
+    project_root = Path(__file__).resolve().parent.parent
+    data_dir = project_root / "data"
+    ckpt_path = project_root / "checkpoints" / "best_model_v2.pth"
+    assets_dir = project_root / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=150)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ArtifactNetV2(dropout=0.0).to(device)
 
-    axes[0].plot(df["epoch"], df["train_loss"], marker="o", linewidth=2, label="Train Loss")
-    axes[0].plot(df["epoch"], df["val_loss"], marker="s", linewidth=2, label="Val Loss")
-    axes[0].axvline(best_ep, linestyle="--", color="green", alpha=0.7, label=f"Best Epoch ({best_ep})")
-    axes[0].set_title("Training vs Validation Loss", fontweight="bold")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].grid(True, linestyle="--", alpha=0.5)
-    axes[0].legend()
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
 
-    axes[1].plot(df["epoch"], df["val_f1"] * 100, marker="o", linewidth=2, label="Val F1 (%)")
-    axes[1].plot(df["epoch"], df["val_accuracy"] * 100, marker="^", linestyle="-.", label="Val Acc (%)")
-    axes[1].plot(df["epoch"], df["val_roc_auc"] * 100, marker="d", linewidth=2, label="Val ROC-AUC (%)")
-    axes[1].set_title("Validation Metrics (%)", fontweight="bold")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Score (%)")
-    axes[1].grid(True, linestyle="--", alpha=0.5)
-    axes[1].legend(loc="lower right")
+    print(f"🔍 ვამოწმებთ ArtifactNet v2.5 Ultra-ს (Epoch {ckpt.get('epoch', '?')}) ხელუხლებელ Test სეტზე...")
+    _, _, test_loader = create_dataloaders(data_dir=data_dir, img_size=256, batch_size=64, num_workers=8)
 
-    plt.tight_layout()
-    plt.savefig(assets_dir / "training_curves.png")
-    plt.close()
+    all_targets, all_probs = [], []
+    with torch.no_grad():
+        for x_rich, x_poor, targets in tqdm(test_loader, desc="Testing"):
+            x_rich = x_rich.to(device, non_blocking=True)
+            x_poor = x_poor.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                logits = model(x_rich, x_poor)
+                probs = torch.sigmoid(logits).squeeze(1)
+            all_targets.extend(targets.numpy())
+            all_probs.extend(probs.to(torch.float32).cpu().numpy())
 
+    y_true = np.array(all_targets)
+    y_probs = np.array(all_probs)
+    metrics = compute_metrics(y_true, y_probs)
 
-def plot_evaluation_charts(y_true: np.ndarray, y_probs: np.ndarray, assets_dir: Path) -> None:
-    """ხატავს Confusion Matrix-ს და ROC Curve-ს."""
-    y_pred = (y_probs >= 0.5).astype(int)
-    cm = confusion_matrix(y_true, y_pred)
+    print("\n🏆 საბოლოო შედეგი ხელუხლებელ Test Set-ზე:")
+    print(f"   • F1-Score:  {metrics['f1']*100:.2f}%")
+    print(f"   • Accuracy:  {metrics['accuracy']*100:.2f}%")
+    print(f"   • Precision: {metrics['precision']*100:.2f}%")
+    print(f"   • Recall:    {metrics['recall']*100:.2f}%")
+    print(f"   • ROC-AUC:   {metrics['roc_auc']*100:.2f}%")
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), dpi=150)
-
+    # Confusion Matrix + ROC Curve
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    cm = confusion_matrix(y_true, (y_probs >= 0.5).astype(int))
     sns.heatmap(
         cm,
         annot=True,
@@ -87,102 +90,43 @@ def plot_evaluation_charts(y_true: np.ndarray, y_probs: np.ndarray, assets_dir: 
         xticklabels=["Real (0)", "AI (1)"],
         yticklabels=["Real (0)", "AI (1)"],
         ax=axes[0],
-        annot_kws={"size": 13, "weight": "bold"},
     )
-    axes[0].set_title("Confusion Matrix (Hold-out Test Set)", fontweight="bold")
-    axes[0].set_xlabel("Predicted Label")
-    axes[0].set_ylabel("True Label")
+    axes[0].set_title("Confusion Matrix (ArtifactNet v2.5 Ultra)")
+    axes[0].set_xlabel("Predicted")
+    axes[0].set_ylabel("Actual")
 
     fpr, tpr, _ = roc_curve(y_true, y_probs)
-    axes[1].plot(fpr, tpr, color="#ea580c", linewidth=2.5, label="ArtifactNet ROC")
-    axes[1].plot([0, 1], [0, 1], color="gray", linestyle="--")
-    axes[1].set_title("ROC Curve (Test Set)", fontweight="bold")
+    axes[1].plot(fpr, tpr, label=f"ROC-AUC = {metrics['roc_auc']*100:.2f}%", linewidth=2.2)
+    axes[1].plot([0, 1], [0, 1], "k--", alpha=0.4)
+    axes[1].set_title("ROC Curve")
     axes[1].set_xlabel("False Positive Rate")
     axes[1].set_ylabel("True Positive Rate")
-    axes[1].grid(True, linestyle="--", alpha=0.5)
     axes[1].legend(loc="lower right")
-
     plt.tight_layout()
-    plt.savefig(assets_dir / "test_evaluation.png")
+    plt.savefig(assets_dir / "test_evaluation_v2.png", dpi=200)
     plt.close()
 
+    # Kaggle test_data_v2 OOD პროგნოზირება
+    test_csv = data_dir / "test.csv"
+    if test_csv.exists():
+        sub_df = pd.read_csv(test_csv)
+        preds = []
+        for _, row in tqdm(sub_df.iterrows(), total=len(sub_df), desc="Predicting test_data_v2 (TTA)"):
+            img_path = data_dir / row["id"]
+            img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                preds.append(0)
+                continue
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            prob = predict_single_image_tta(model, img_rgb, device)
+            preds.append(1 if prob >= 0.5 else 0)
 
-@torch.no_grad()
-def main() -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    project_root = SRC_DIR.parent
-    data_dir = project_root / "data"
-    checkpoints_dir = project_root / "checkpoints"
-    assets_dir = project_root / "assets"
-    assets_dir.mkdir(parents=True, exist_ok=True)
-
-    checkpoint_path = checkpoints_dir / "best_model.pth"
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    config = checkpoint.get("config", {"img_size": 256, "batch_size": 80, "num_workers": 4})
-
-    model = ArtifactNet(num_classes=1, dropout_rate=0.0).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    print("=" * 65)
-    print(f"🔍 ვამოწმებთ საუკეთესო მოდელს (Epoch {checkpoint['epoch']}) დამოუკიდებელ Test სეტზე")
-    print("=" * 65)
-
-    _, _, test_loader = create_dataloaders(
-        data_dir=data_dir,
-        img_size=config["img_size"],
-        batch_size=config["batch_size"],
-        num_workers=config["num_workers"],
-    )
-
-    all_probs, all_labels = [], []
-    for images, labels in tqdm(test_loader, desc="Testing [7,996 images]"):
-        images = images.to(device, non_blocking=True)
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = model(images)
-            probs = torch.sigmoid(logits)
-        all_probs.append(probs.float().cpu().numpy())
-        all_labels.append(labels.numpy())
-
-    y_probs = np.concatenate(all_probs).flatten()
-    y_true = np.concatenate(all_labels).flatten()
-    metrics = compute_metrics(y_true, y_probs, threshold=0.5)
-
-    print("\n🏆 საბოლოო შედეგი ხელუხლებელ Test Set-ზე (7,996 ფოტო):")
-    print(f"   • F1-Score:  {metrics['f1']*100:.2f}%")
-    print(f"   • Accuracy:  {metrics['accuracy']*100:.2f}%")
-    print(f"   • Precision: {metrics['precision']*100:.2f}%")
-    print(f"   • Recall:    {metrics['recall']*100:.2f}%")
-    print(f"   • ROC-AUC:   {metrics['roc_auc']*100:.2f}%")
-
-    plot_training_history(checkpoints_dir / "training_history.csv", assets_dir)
-    plot_evaluation_charts(y_true, y_probs, assets_dir)
-    print(f"📈 გრაფიკები შენახულია ფოლდერში: {assets_dir}")
-
-    # Kaggle-ის 5,540 უცნობ სურათზე პროგნოზირება
-    test_csv_path = data_dir / "test.csv"
-    if test_csv_path.exists():
-        test_df = pd.read_csv(test_csv_path)
-        _, val_tf = get_transforms(img_size=config["img_size"])
-        kaggle_ds = KaggleTestDataset(test_df, data_dir, transform=val_tf)
-        kaggle_loader = DataLoader(kaggle_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4)
-
-        preds_list, ids_list = [], []
-        for images, img_ids in tqdm(kaggle_loader, desc="Predicting test_data_v2"):
-            images = images.to(device, non_blocking=True)
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                probs = torch.sigmoid(model(images)).float().cpu().numpy().flatten()
-            preds = (probs >= 0.5).astype(int)
-            preds_list.extend(preds.tolist())
-            ids_list.extend(list(img_ids))
-
-        sub_df = pd.DataFrame({"id": ids_list, "label": preds_list})
-        sub_path = project_root / "submission.csv"
-        sub_df.to_csv(sub_path, index=False)
-        ai_count = int((sub_df["label"] == 1).sum())
-        real_count = int((sub_df["label"] == 0).sum())
-        print(f"✅ Kaggle submission.csv მზადაა! (Real: {real_count}, AI: {ai_count})")
+        sub_df["label"] = preds
+        sub_df.to_csv(project_root / "submission_v2.csv", index=False)
+        n_ai = int(np.sum(preds))
+        n_real = len(preds) - n_ai
+        print(f"✅ Kaggle submission_v2.csv მზადაა! (Real: {n_real}, AI: {n_ai} [{n_ai/len(preds)*100:.1f}%])")
 
 
 if __name__ == "__main__":
-    main()
+    evaluate()
