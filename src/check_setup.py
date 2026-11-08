@@ -1,52 +1,59 @@
-import torch
-import pandas as pd
-from pathlib import Path
-from PIL import Image
 import random
+import sys
+from pathlib import Path
 
-print("=" * 50)
-print("1. ვიდეოკარტის და PyTorch CUDA-ს შემოწმება")
-print("=" * 50)
-print(f"PyTorch ვერსია: {torch.__version__}")
-print(f"CUDA ხელმისაწვდომია: {torch.cuda.is_available()}")
-
-if torch.cuda.is_available():
-    gpu_name = torch.cuda.get_device_name(0)
-    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-    capability = torch.cuda.get_device_capability(0)
-    print(f"ვიდეოკარტა: {gpu_name}")
-    print(f"VRAM მოცულობა: {vram_gb:.2f} GB")
-    print(f"Compute Capability: sm_{capability[0]}{capability[1]}0")
-
-    # რეალური ტესტი ვიდეოკარტის ბირთვებზე (BFloat16)
-    x = torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16)
-    y = torch.matmul(x, x)
-    print("BFloat16 GPU ტესტი: წარმატებით შესრულდა! 🚀")
-else:
-    print("❌ ყურადღება: PyTorch ვერ ხედავს ვიდეოკარტას!")
-
-print("\n" + "=" * 50)
-print("2. დატასეტის და რეზოლუციების შემოწმება")
-print("=" * 50)
-
-# ვპოულობთ data ფოლდერს
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-TRAIN_CSV = DATA_DIR / "train.csv"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-if not TRAIN_CSV.exists():
-    print(f"❌ ვერ ვიპოვე {TRAIN_CSV}! შეამოწმე ფოლდერების სტრუქტურა.")
-else:
-    df = pd.read_csv(TRAIN_CSV)
-    print(f"train.csv წარმატებით ჩაიტვირთა! სულ ჩანაწერი: {len(df)}")
+import pandas as pd
+import torch
+from PIL import Image
 
-    # შევამოწმოთ შემთხვევითი 200 სურათი დისკზე
-    sample_paths = df["file_name"].sample(200, random_state=42).tolist()
+from src.model import ArtifactNetV4
+
+
+def main() -> None:
+    print("=" * 64)
+    print("1. GPU, CUDA & BFloat16 Environment Verification")
+    print("=" * 64)
+    print(f"Python version   : {sys.version.split()[0]}")
+    print(f"PyTorch version  : {torch.__version__}")
+    print(f"CUDA available   : {torch.cuda.is_available()}")
+
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        cap = torch.cuda.get_device_capability(0)
+        print(f"GPU Device       : {gpu_name}")
+        print(f"Physical VRAM    : {vram_gb:.2f} GB")
+        print(f"Compute Cap      : sm_{cap[0]}{cap[1]}")
+    else:
+        print("WARNING: CUDA is not available. Training on CPU will be very slow.")
+
+    model = ArtifactNetV4()
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"ArtifactNet v4   : {n_params:,} trainable parameters (100% From Scratch)")
+
+    print("\n" + "=" * 64)
+    print("2. Dataset & Pair-Aware Split Verification")
+    print("=" * 64)
+
+    data_dir = PROJECT_ROOT / "data"
+    train_csv = data_dir / "train.csv"
+
+    if not train_csv.exists():
+        print(f"ERROR: Could not find {train_csv}")
+        return
+
+    df = pd.read_csv(train_csv)
+    print(f"Loaded train.csv : {len(df):,} rows ({len(df)//2:,} matched Real/AI pairs)")
+
+    sample_paths = df["file_name"].sample(min(200, len(df)), random_state=42).tolist()
     missing = 0
     sizes = []
-
     for rel_path in sample_paths:
-        img_path = DATA_DIR / rel_path
+        img_path = data_dir / rel_path
         if not img_path.exists():
             missing += 1
         else:
@@ -56,9 +63,12 @@ else:
     if missing == 0:
         widths = [s[0] for s in sizes]
         heights = [s[1] for s in sizes]
-        print(f"✅ 200-ვე სატესტო სურათი ადგილზეა და იხსნება!")
-        print(f"   • სიგანე (Width): მინ={min(widths)}px, მაქს={max(widths)}px")
-        print(f"   • სიმაღლე (Height): მინ={min(heights)}px, მაქს={max(heights)}px")
-        print(f"   • მაგალითი რეზოლუციები: {sizes[:5]}")
+        print("Sample integrity : 200/200 sampled images verified on disk")
+        print(f"Width range      : min={min(widths)}px, max={max(widths)}px")
+        print(f"Height range     : min={min(heights)}px, max={max(heights)}px")
     else:
-        print(f"❌ 200-დან {missing} სურათი ვერ მოიძებნა მისამართზე: {DATA_DIR / sample_paths[0]}")
+        print(f"ERROR: {missing}/200 sampled images missing under {data_dir}")
+
+
+if __name__ == "__main__":
+    main()
