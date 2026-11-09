@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from src.forensic_council import ForensicCouncil
-from src.model import ArtifactNetV4
+from src.model import ArtifactNetV5
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT_DIR = PROJECT_ROOT / "checkpoints"
@@ -23,26 +23,26 @@ _STATE = {
 }
 
 
-def _resolve_v4_ckpt() -> Path | None:
-    v4_path = CKPT_DIR / "best_model_v4.pth"
-    if v4_path.exists():
-        return v4_path
+def _resolve_v5_ckpt() -> Path | None:
+    v5_path = CKPT_DIR / "best_model_v5.pth"
+    if v5_path.exists():
+        return v5_path
     generic_path = CKPT_DIR / "best_model.pth"
     if generic_path.exists():
         try:
             meta = torch.load(generic_path, map_location="cpu", weights_only=False)
-            if isinstance(meta, dict) and meta.get("architecture") == "ArtifactNetV4":
+            if isinstance(meta, dict) and meta.get("architecture") == "ArtifactNetV5":
                 return generic_path
         except Exception:
             pass
-    last_v4 = CKPT_DIR / "last_model_v4.pth"
-    if last_v4.exists():
-        return last_v4
+    last_v5 = CKPT_DIR / "last_model_v5.pth"
+    if last_v5.exists():
+        return last_v5
     return None
 
 
 def get_council() -> tuple[ForensicCouncil | None, str]:
-    ckpt_path = _resolve_v4_ckpt()
+    ckpt_path = _resolve_v5_ckpt()
     if ckpt_path is None:
         return None, "untrained"
 
@@ -50,7 +50,7 @@ def get_council() -> tuple[ForensicCouncil | None, str]:
     if _STATE["council"] is not None and _STATE["ckpt_name"] == ckpt_path.name and _STATE["ckpt_mtime"] == mtime:
         return _STATE["council"], f"{ckpt_path.name} (Epoch {_STATE['epoch']})"
 
-    model = ArtifactNetV4(dropout=0.0).to(DEVICE)
+    model = ArtifactNetV5(dropout=0.0).to(DEVICE)
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     state_dict = ckpt.get("ema_state_dict", ckpt["model_state_dict"]) if "model_state_dict" in ckpt else ckpt
     model.load_state_dict(state_dict, strict=True)
@@ -64,7 +64,6 @@ def get_council() -> tuple[ForensicCouncil | None, str]:
     return council, f"{ckpt_path.name} (Epoch {_STATE['epoch']})"
 
 
-# Pre-load if already trained
 get_council()
 
 
@@ -79,21 +78,15 @@ def analyze_image(
             empty,
             empty,
             empty,
-            "Upload an image (JPEG, PNG, or WebP of any resolution) to run forensic inspection.",
+            "Upload an image (fresh upload, messenger forward, social download, or screenshot) to run forensic inspection.",
         )
 
     council, status_str = get_council()
     if council is None:
         msg = (
-            "### ⚠️ ArtifactNet v4 Checkpoint Not Trained Yet\n"
-            "The codebase has been upgraded to **ArtifactNet v4**, which requires training its new 4-Stream + "
-            "8-Prototype Real-Camera Manifold weights from scratch.\n\n"
-            "Run the following command in your terminal:\n"
-            "```bash\n"
-            "python src/train.py\n"
-            "```\n"
-            "Once Epoch 1 completes (or full training finishes), upload an image again—this app will hot-load "
-            "`checkpoints/best_model_v4.pth` automatically without restarting."
+            "### ⚠️ ArtifactNet v5 Checkpoint Not Trained Yet\n"
+            "Run `python src/train.py` to train **ArtifactNet v5** from scratch. "
+            "This dashboard hot-loads `checkpoints/best_model_v5.pth` automatically once Epoch 1 finishes."
         )
         return (
             {"Real Photograph (Camera)": 0.0, "AI-Generated (Synthetic)": 0.0},
@@ -140,12 +133,15 @@ def analyze_image(
     lines = [
         f"### 🎯 Verdict: {verdict_str}",
         f"- **Checkpoint:** `{status_str}` | **Inference Mode:** {tta_str}",
-        f"- **Real-Camera Manifold (8 Prototypes):** {manifold_status}",
+        f"- **Real-Camera Manifold (16 Prototypes):** {manifold_status}",
         f"- **Input Diagnostics:** `{w}×{h}px` | **Color Profile:** {color_mode} | **Stripped Border/Canvas:** `{res['canvas_ratio']*100:.1f}%`",
-        "",
-        "### 🔬 Calibrated Multi-Stream & Physical Breakdown:",
     ]
 
+    if ai_prob >= 0.35 and res.get("top_families"):
+        fam_str = " · ".join(f"**{fname}** (`{fprob*100:.0f}%`)" for fname, fprob in res["top_families"])
+        lines.append(f"- **Closest Synthetic Architecture Signature:** {fam_str}")
+
+    lines.extend(["", "### 🔬 Calibrated Multi-Stream & Physical Breakdown:"])
     for name, score, weight in res["experts"]:
         badge = "🔴 Synthetic Signal" if score >= 0.50 else "🟢 Camera Signal"
         lines.append(f"- **{name}:** `{score*100:.1f}% AI` ({badge}, weight `{weight:.2f}`)")
@@ -159,19 +155,18 @@ def analyze_image(
     )
 
 
-with gr.Blocks(title="ArtifactNet v4 — Multi-Stream & Real-Manifold Forensic Detector") as demo:
+with gr.Blocks(title="ArtifactNet v5 — Multi-Generator & Internet-Resilient Forensic Detector") as demo:
     gr.Markdown(
-        "# 🔬 ArtifactNet v4: From-Scratch Multi-Stream & Real-Manifold AI Image Detector\n"
-        "100% custom architecture trained strictly from scratch (zero pretrained backbones). Combines "
-        "**Intra-Image Rich-vs-Poor Differential Forensics**, **Multi-Scale Wavelet/FFT Phase Coherence**, "
-        "**64-Patch Self-Consistency ViT**, **Differential Gram Covariance**, and an **8-Prototype Real-Camera Manifold**."
+        "# 🔬 ArtifactNet v5: From-Scratch Multi-Generator & Internet-Resilient AI Image Detector\n"
+        "100% custom architecture (`16.74M` params, **zero pretrained backbones**) trained from scratch across "
+        "**65+ modern 2024–2026 generator families**, **real smartphone/DSLR corpora**, and **1-hop / 2-hop social & messenger compression chains**."
     )
     with gr.Row():
         with gr.Column(scale=1):
-            in_img = gr.Image(type="numpy", label="Upload Image (Any Resolution, JPEG / PNG / WebP)")
+            in_img = gr.Image(type="numpy", label="Upload Any Image (Fresh, Compressed, Downloaded, or Forwarded)")
             use_tta_chk = gr.Checkbox(
                 value=True,
-                label="Enable 4-View Multi-Scale + Flip Test-Time Augmentation (Recommended)",
+                label="Enable 4-View Multi-Scale + Flip Test-Time Augmentation (1024px Native + 640px Meso)",
             )
             btn = gr.Button("🔍 Run Forensic Inspection", variant="primary")
         with gr.Column(scale=1):

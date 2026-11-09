@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
-CANONICAL_MAX_LONG_SIDE = 896
+CANONICAL_MAX_LONG_SIDE = 1024
 
 
 def ensure_rgb_uint8(img: np.ndarray) -> np.ndarray:
@@ -27,7 +27,6 @@ def ensure_rgb_uint8(img: np.ndarray) -> np.ndarray:
     elif img.ndim == 3 and img.shape[2] == 1:
         img = np.repeat(img, 3, axis=2)
     elif img.ndim == 3 and img.shape[2] == 4:
-        # Composite RGBA onto neutral mid-gray so transparent borders don't create harsh step edges
         alpha = img[:, :, 3:4].astype(np.float32) / 255.0
         rgb = img[:, :, :3].astype(np.float32)
         img = np.clip(rgb * alpha + 128.0 * (1.0 - alpha), 0.0, 255.0).astype(np.uint8)
@@ -85,7 +84,7 @@ def canonicalize_scale(
 ) -> np.ndarray:
     """
     Harmonizes input pixel pitch so 32x32 micro-tiles represent physical scene structure consistently
-    across 768px dataset images, 1792px generator outputs, and 4000px camera photos.
+    across 768px web images, 1024px-1536px generator outputs, and 4000px camera photos.
     Uses INTER_AREA (exact box integration / sensor binning) when downsampling.
     """
     h, w = img_rgb.shape[:2]
@@ -136,7 +135,6 @@ def smash_and_reconstruct_rich_poor(
     cropped = img[: nh * patch_size, : nw * patch_size]
     patches = cropped.reshape(nh, patch_size, nw, patch_size, c).swapaxes(1, 2).reshape(-1, patch_size, patch_size, c)
 
-    # Supplement with half-stride shifted patches when source resolution is compact
     if patches.shape[0] < 96 and h >= patch_size * 2 + 16 and w >= patch_size * 2 + 16:
         sh, sw = (h - 16) // patch_size, (w - 16) // patch_size
         if sh >= 2 and sw >= 2:
@@ -239,6 +237,7 @@ def prepare_splits(
     val_ratio: float = 0.1,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Legacy single-dataset split loader (`data/splits/`)."""
     splits_dir = data_dir / "splits"
     splits_dir.mkdir(parents=True, exist_ok=True)
 
@@ -282,71 +281,187 @@ def prepare_splits(
     return train_df, val_df, test_df
 
 
-def sample_shared_aug_params(rng: np.random.Generator) -> dict:
+def prepare_splits_v5(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Samples a single random imaging-pipeline configuration applied IDENTICALLY to both
-    Real_k and AI_k in a matched pair, cancelling all compression, scale, and ISP shortcuts.
+    Loads `data/splits_v5/{train_split,val_id_split,val_ood_split,test_ood_split}.csv`
+    created by `src/harvest_dataset.py`. Falls back gracefully to `prepare_splits` if v5 splits do not exist yet.
+    """
+    v5_dir = data_dir / "splits_v5"
+    p_train = v5_dir / "train_split.csv"
+    p_val_id = v5_dir / "val_id_split.csv"
+    p_val_ood = v5_dir / "val_ood_split.csv"
+    p_test_ood = v5_dir / "test_ood_split.csv"
+
+    if p_train.exists() and p_val_id.exists() and p_val_ood.exists() and p_test_ood.exists():
+        return (
+            pd.read_csv(p_train),
+            pd.read_csv(p_val_id),
+            pd.read_csv(p_val_ood),
+            pd.read_csv(p_test_ood),
+        )
+
+    tr, vl, ts = prepare_splits(data_dir)
+    for df_tmp in (tr, vl, ts):
+        if "family" not in df_tmp.columns:
+            df_tmp["family"] = np.where(df_tmp["label"].astype(int) == 0, 0, 11)
+        if "generator" not in df_tmp.columns:
+            df_tmp["generator"] = np.where(df_tmp["label"].astype(int) == 0, "shutterstock_real", "deepmedia_v1")
+        if "source_dataset" not in df_tmp.columns:
+            df_tmp["source_dataset"] = "legacy_train_v1"
+    return tr, vl, vl.copy(), ts
+
+
+def _encode_decode_rgb(img_rgb: np.ndarray, codec: str, quality: int) -> np.ndarray:
+    if codec == "none":
+        return img_rgb
+    bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    ok = False
+    enc = None
+    if codec == "jpeg_444":
+        q = int(np.clip(quality, 60, 99))
+        ok, enc = cv2.imencode(
+            ".jpg",
+            bgr,
+            [
+                int(cv2.IMWRITE_JPEG_QUALITY),
+                q,
+                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR),
+                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444),
+            ],
+        )
+    elif codec == "jpeg_420":
+        q = int(np.clip(quality, 46, 96))
+        ok, enc = cv2.imencode(
+            ".jpg",
+            bgr,
+            [
+                int(cv2.IMWRITE_JPEG_QUALITY),
+                q,
+                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR),
+                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420),
+            ],
+        )
+    elif codec == "webp":
+        q = int(np.clip(quality, 50, 96))
+        ok, enc = cv2.imencode(".webp", bgr, [int(cv2.IMWRITE_WEBP_QUALITY), q])
+
+    if ok and enc is not None:
+        dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+        if dec is not None:
+            return cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
+    return img_rgb
+
+
+def sample_internet_laundering_params(rng: np.random.Generator) -> dict:
+    """
+    Samples a realistic multi-hop internet / social-media / messenger laundering pipeline
+    applied IDENTICALLY to both Real_k and AI_k in every matched training pair:
+      - Regime 'clean' (22%): Fresh camera/generator upload (only sub-block crop shift + dihedral symmetry + clean/PNG/Q96).
+      - Regime '1hop_social' (30%): Single messenger/platform delivery (WhatsApp, Instagram, Telegram, X/WebP CDN).
+      - Regime '2hop_laundered' (32%): Uploaded -> Compressed/Resized -> Downloaded -> Forwarded/Saved (including compressed-then-PNG!).
+      - Regime 'harsh_web' (16%): Thumbnail/screenshot/ISP blur-sharpen + heavy Q54-70 re-encoding.
     """
     interps = [cv2.INTER_AREA, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_LANCZOS4]
-    codec_roll = float(rng.random())
-    if codec_roll < 0.30:
-        codec = "jpeg_444"
-    elif codec_roll < 0.60:
-        codec = "jpeg_420"
-    elif codec_roll < 0.68:
-        codec = "webp"
+    r_roll = float(rng.random())
+    if r_roll < 0.22:
+        regime = "clean"
+    elif r_roll < 0.52:
+        regime = "1hop_social"
+    elif r_roll < 0.84:
+        regime = "2hop_laundered"
     else:
-        codec = "none"  # Uncompressed float->uint8 pass-through (mimics PNG uploads)
+        regime = "harsh_web"
 
     isp_roll = float(rng.random())
-    if isp_roll < 0.16:
+    if isp_roll < 0.18:
         isp_mode = "sharpen"
-    elif isp_roll < 0.28:
+    elif isp_roll < 0.30:
         isp_mode = "soften"
     elif isp_roll < 0.42:
         isp_mode = "iso_grain"
     else:
         isp_mode = "none"
 
+    # Hop 1 & Hop 2 codec selection per regime
+    if regime == "clean":
+        c_roll = float(rng.random())
+        hop1_codec = "none" if c_roll < 0.55 else ("jpeg_444" if c_roll < 0.85 else "webp")
+        hop1_q = int(rng.integers(92, 99))
+        hop1_scale = float(rng.uniform(0.92, 1.08)) if rng.random() < 0.25 else 1.0
+        do_hop2 = False
+        hop2_codec, hop2_q, hop2_scale = "none", 95, 1.0
+    elif regime == "1hop_social":
+        c_roll = float(rng.random())
+        hop1_codec = "jpeg_420" if c_roll < 0.72 else ("webp" if c_roll < 0.92 else "jpeg_444")
+        hop1_q = int(rng.integers(70, 86))
+        hop1_scale = float(rng.uniform(0.68, 1.16))
+        do_hop2 = False
+        hop2_codec, hop2_q, hop2_scale = "none", 90, 1.0
+    elif regime == "2hop_laundered":
+        hop1_codec = "jpeg_420" if rng.random() < 0.70 else "webp"
+        hop1_q = int(rng.integers(74, 89))
+        hop1_scale = float(rng.uniform(0.64, 1.22))
+        do_hop2 = True
+        c2_roll = float(rng.random())
+        # 20% of 2-hop chains end in lossless 'none' (simulates screenshotting or saving a compressed web image as PNG!)
+        if c2_roll < 0.55:
+            hop2_codec = "jpeg_420"
+        elif c2_roll < 0.80:
+            hop2_codec = "webp"
+        else:
+            hop2_codec = "none"
+        hop2_q = int(rng.integers(65, 83))
+        hop2_scale = float(rng.uniform(0.72, 1.12))
+    else:
+        # harsh_web
+        hop1_codec = "jpeg_420" if rng.random() < 0.75 else "webp"
+        hop1_q = int(rng.integers(52, 71))
+        hop1_scale = float(rng.uniform(0.46, 0.78))
+        do_hop2 = bool(rng.random() < 0.50)
+        hop2_codec = "jpeg_420" if rng.random() < 0.70 else "none"
+        hop2_q = int(rng.integers(54, 74))
+        hop2_scale = float(rng.uniform(0.82, 1.20))
+
     return {
-        # 1. Sub-8x8 pixel crop offset breaks baked-in Q75 DCT block alignment
-        "do_grid_shift": bool(rng.random() < 0.85),
+        "regime": regime,
+        "do_grid_shift": bool(rng.random() < 0.88),
         "dy1": int(rng.integers(0, 8)),
         "dx1": int(rng.integers(0, 8)),
         "dy2": int(rng.integers(0, 8)),
         "dx2": int(rng.integers(0, 8)),
-        # 2. Exact dihedral symmetries
         "hflip": bool(rng.random() < 0.50),
-        "vflip": bool(rng.random() < 0.20),
-        "rot90_k": int(rng.integers(0, 4)) if rng.random() < 0.50 else 0,
-        # 3. Multi-scale resampling (both <1.0 downscale and >1.0 upscale!)
-        "do_scale": bool(rng.random() < 0.68),
-        "scale": float(rng.uniform(0.56, 1.38)),
-        "interp": int(interps[int(rng.integers(0, len(interps)))]),
-        # 4. Symmetric ISP / optical perturbation (never flips class label!)
+        "vflip": bool(rng.random() < 0.15),
+        "rot90_k": int(rng.integers(0, 4)) if rng.random() < 0.35 else 0,
+        "hop1_scale": hop1_scale,
+        "hop1_interp": int(interps[int(rng.integers(0, len(interps)))]),
+        "hop1_codec": hop1_codec,
+        "hop1_q": hop1_q,
         "isp_mode": isp_mode,
-        "sharpen_alpha": float(rng.uniform(0.15, 0.42)),
-        "blur_sigma": float(rng.uniform(0.35, 0.90)),
-        "grain_sigma": float(rng.uniform(1.2, 4.5)),
+        "sharpen_alpha": float(rng.uniform(0.14, 0.38)),
+        "blur_sigma": float(rng.uniform(0.35, 0.92)),
+        "grain_sigma": float(rng.uniform(1.0, 4.0)),
         "grain_seed": int(rng.integers(0, 2**31 - 1)),
-        # 5. Photometric & monochrome equivariance
-        "do_photo": bool(rng.random() < 0.35),
-        "alpha_gain": float(rng.uniform(0.90, 1.10)),
-        "beta_bias": float(rng.uniform(-10.0, 10.0)),
-        "gamma": float(rng.uniform(0.90, 1.12)),
-        "to_monochrome": bool(rng.random() < 0.06),
-        # 6. Multi-codec & chroma-subsampling diversity
-        "codec": codec,
-        "quality": int(rng.integers(52, 99)),
-        # 7. Synchronized rich-patch masking
-        "do_mask": bool(rng.random() < 0.30),
-        "mask_count": int(rng.integers(2, 11)),
+        "do_photo": bool(rng.random() < 0.36),
+        "alpha_gain": float(rng.uniform(0.91, 1.09)),
+        "beta_bias": float(rng.uniform(-9.0, 9.0)),
+        "gamma": float(rng.uniform(0.91, 1.10)),
+        "to_monochrome": bool(rng.random() < 0.04),
+        "do_hop2": do_hop2,
+        "hop2_shift_y": int(rng.integers(1, 6)),
+        "hop2_shift_x": int(rng.integers(1, 6)),
+        "hop2_scale": hop2_scale,
+        "hop2_interp": int(interps[int(rng.integers(0, len(interps)))]),
+        "hop2_sharpen": float(rng.uniform(0.10, 0.26)) if rng.random() < 0.35 else 0.0,
+        "hop2_codec": hop2_codec,
+        "hop2_q": hop2_q,
+        "do_mask": bool(rng.random() < 0.25),
+        "mask_count": int(rng.integers(2, 9)),
         "mask_seed": int(rng.integers(0, 2**31 - 1)),
         "patch_seed": int(rng.integers(0, 2**31 - 1)),
     }
 
 
-def apply_shared_aug(img_rgb: np.ndarray, p: dict) -> np.ndarray:
+def apply_internet_laundering(img_rgb: np.ndarray, p: dict) -> np.ndarray:
     out = ensure_rgb_uint8(img_rgb)
     h, w = out.shape[:2]
 
@@ -365,11 +480,12 @@ def apply_shared_aug(img_rgb: np.ndarray, p: dict) -> np.ndarray:
     if p["rot90_k"] > 0:
         out = np.rot90(out, k=p["rot90_k"]).copy()
 
-    if p["do_scale"]:
+    # Hop 1: Scale + ISP / Photometric + Platform Codec 1
+    if abs(p["hop1_scale"] - 1.0) > 1e-3:
         ch, cw = out.shape[:2]
-        nh = int(np.clip(round(ch * p["scale"]), 192, 1024))
-        nw = int(np.clip(round(cw * p["scale"]), 192, 1024))
-        out = cv2.resize(out, (nw, nh), interpolation=p["interp"])
+        nh = int(np.clip(round(ch * p["hop1_scale"]), 176, 1152))
+        nw = int(np.clip(round(cw * p["hop1_scale"]), 176, 1152))
+        out = cv2.resize(out, (nw, nh), interpolation=p["hop1_interp"])
 
     isp = p["isp_mode"]
     if isp == "sharpen":
@@ -394,37 +510,35 @@ def apply_shared_aug(img_rgb: np.ndarray, p: dict) -> np.ndarray:
         gray = cv2.cvtColor(out, cv2.COLOR_RGB2GRAY)
         out = np.stack([gray, gray, gray], axis=-1)
 
-    codec = p["codec"]
-    if codec != "none":
-        bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-        ok = False
-        enc = None
-        if codec == "jpeg_444":
-            params = [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                p["quality"],
-                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR),
-                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444),
-            ]
-            ok, enc = cv2.imencode(".jpg", bgr, params)
-        elif codec == "jpeg_420":
-            q = max(48, min(95, p["quality"]))
-            params = [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                q,
-                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR),
-                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420),
-            ]
-            ok, enc = cv2.imencode(".jpg", bgr, params)
-        elif codec == "webp":
-            ok, enc = cv2.imencode(".webp", bgr, [int(cv2.IMWRITE_WEBP_QUALITY), max(58, p["quality"])])
+    out = _encode_decode_rgb(out, p["hop1_codec"], p["hop1_q"])
 
-        if ok and enc is not None:
-            dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-            if dec is not None:
-                out = cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
+    # Hop 2: Second platform / forward / download / screenshot-save hop
+    if p["do_hop2"]:
+        ch, cw = out.shape[:2]
+        if ch > 96 and cw > 96:
+            sy = min(p["hop2_shift_y"], ch // 12)
+            sx = min(p["hop2_shift_x"], cw // 12)
+            out = out[sy:, sx:]
+            ch, cw = out.shape[:2]
+
+        if abs(p["hop2_scale"] - 1.0) > 1e-3:
+            nh = int(np.clip(round(ch * p["hop2_scale"]), 176, 1088))
+            nw = int(np.clip(round(cw * p["hop2_scale"]), 176, 1088))
+            out = cv2.resize(out, (nw, nh), interpolation=p["hop2_interp"])
+
+        if p["hop2_sharpen"] > 0.0:
+            blur2 = cv2.GaussianBlur(out, (0, 0), sigmaX=0.9)
+            a2 = p["hop2_sharpen"]
+            out = cv2.addWeighted(out, 1.0 + a2, blur2, -a2, 0)
+
+        out = _encode_decode_rgb(out, p["hop2_codec"], p["hop2_q"])
 
     return out
+
+
+# Backward-compatible aliases
+sample_shared_aug_params = sample_internet_laundering_params
+apply_shared_aug = apply_internet_laundering
 
 
 def apply_patch_mask_sync(img: np.ndarray, count: int, seed: int, patch_size: int = 32) -> np.ndarray:
@@ -446,58 +560,89 @@ def apply_patch_mask_sync(img: np.ndarray, count: int, seed: int, patch_size: in
 
 def apply_eval_perturbation(img_rgb: np.ndarray, mode: str) -> np.ndarray:
     """
-    Deterministic out-of-domain imaging transforms for epoch validation & final stress-testing:
-    - 'clean': untouched dataset image
-    - 'upscale_1_8x': 1.8x bicubic upscale (breaks 768px pixel pitch; caught v2's 8% Real specificity bug)
-    - 'downscale_0_68x_png': (3,5) sub-block shift + 0.68x INTER_AREA (erases Q75 8x8 grid, lossless PNG-like)
-    - 'jpeg_q96_444': (5,3) shift + 1.15x Lanczos + JPEG Q96 4:4:4 (mimics modern DSLR & OOD generator JPEGs)
-    - 'phone_isp': bilateral smooth + unsharp mask + JPEG Q90 (mimics iPhone/Samsung computational ISP)
-    - 'fft_hf_knockout': notches out radial high-frequency ring [0.50, 0.88] in 2D FFT (tests shortcut removal)
+    Deterministic out-of-domain & internet-laundering transforms for validation & final stress-testing:
+      - 'clean': untouched image
+      - 'whatsapp_1hop': 1280px max-side INTER_AREA + JPEG Q74 (4:2:0) messenger delivery
+      - 'social_2hop_chain': Upload (0.82x + sharpen + Q82) -> Download -> Forward/Save (sub-block shift + 0.88x + WebP Q76 -> JPEG Q73)
+      - 'webp_cdn_q75': Sub-block shift + 0.90x resize + WebP Q75 CDN delivery
+      - 'screenshot_reencode': Compressed web JPEG Q72 -> 1.12x screen bilinear scale + gamma 1.04 -> saved lossless (PNG-like)
+      - 'phone_isp': Bilateral denoise + unsharp mask + JPEG Q90
+      - 'upscale_1_8x': 1.8x bicubic upscale
+      - 'downscale_0_68x_png': Sub-block shift + 0.68x INTER_AREA lossless
+      - 'jpeg_q96_444': Sub-block shift + 1.15x Lanczos + JPEG Q96 (4:4:4)
+      - 'fft_hf_knockout': Notches out radial high-frequency ring [0.50, 0.88] in 2D FFT
     """
     img = ensure_rgb_uint8(img_rgb)
     h, w = img.shape[:2]
 
     if mode == "clean":
         return img
+
+    if mode == "whatsapp_1hop":
+        long_s = max(h, w)
+        if long_s > 1280 or long_s < 800:
+            sc = min(1280.0 / max(1, long_s), 0.92)
+            nh, nw = max(160, int(round(h * sc))), max(160, int(round(w * sc)))
+            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+        return _encode_decode_rgb(img, "jpeg_420", 74)
+
+    if mode == "social_2hop_chain":
+        # Hop 1: Social platform upload (0.82x bicubic + subtle unsharp + JPEG Q82 4:2:0)
+        nh1, nw1 = max(176, int(round(h * 0.82))), max(176, int(round(w * 0.82)))
+        hop1 = cv2.resize(img, (nw1, nh1), interpolation=cv2.INTER_CUBIC)
+        blur1 = cv2.GaussianBlur(hop1, (0, 0), 1.0)
+        hop1 = cv2.addWeighted(hop1, 1.20, blur1, -0.20, 0)
+        hop1 = _encode_decode_rgb(hop1, "jpeg_420", 82)
+        # Hop 2: Downloaded, misaligned DCT grid, resized, WebP CDN + messenger JPEG Q73
+        ch, cw = hop1.shape[:2]
+        if ch > 96 and cw > 96:
+            hop1 = hop1[3:, 5:]
+            ch, cw = hop1.shape[:2]
+        nh2, nw2 = max(160, int(round(ch * 0.88))), max(160, int(round(cw * 0.88)))
+        hop2 = cv2.resize(hop1, (nw2, nh2), interpolation=cv2.INTER_AREA)
+        hop2 = _encode_decode_rgb(hop2, "webp", 76)
+        return _encode_decode_rgb(hop2, "jpeg_420", 73)
+
+    if mode == "webp_cdn_q75":
+        cropped = img[2 : max(66, h - 2), 4 : max(68, w - 2)] if (h > 96 and w > 96) else img
+        ch, cw = cropped.shape[:2]
+        resized = cv2.resize(
+            cropped, (max(160, int(round(cw * 0.90))), max(160, int(round(ch * 0.90)))), interpolation=cv2.INTER_LINEAR
+        )
+        return _encode_decode_rgb(resized, "webp", 75)
+
+    if mode == "screenshot_reencode":
+        nh1, nw1 = max(160, int(round(h * 0.76))), max(160, int(round(w * 0.76)))
+        web_img = _encode_decode_rgb(cv2.resize(img, (nw1, nh1), interpolation=cv2.INTER_AREA), "jpeg_420", 72)
+        ch, cw = web_img.shape[:2]
+        scr = cv2.resize(
+            web_img, (int(round(cw * 1.12)), int(round(ch * 1.12))), interpolation=cv2.INTER_LINEAR
+        )
+        scr_f = np.clip(scr.astype(np.float32) / 255.0, 0.0, 1.0) ** 1.04
+        return np.clip(scr_f * 255.0, 0.0, 255.0).astype(np.uint8)
+
     if mode == "upscale_1_8x":
         return cv2.resize(img, (int(round(w * 1.8)), int(round(h * 1.8))), interpolation=cv2.INTER_CUBIC)
+
     if mode == "downscale_0_68x_png":
         cropped = img[3 : max(67, h - 2), 5 : max(69, w - 2)] if (h > 96 and w > 96) else img
         ch, cw = cropped.shape[:2]
         return cv2.resize(
             cropped, (max(160, int(round(cw * 0.68))), max(160, int(round(ch * 0.68)))), interpolation=cv2.INTER_AREA
         )
+
     if mode == "jpeg_q96_444":
         cropped = img[5 : max(69, h - 3), 3 : max(67, w - 3)] if (h > 96 and w > 96) else img
         ch, cw = cropped.shape[:2]
         up = cv2.resize(cropped, (int(round(cw * 1.15)), int(round(ch * 1.15))), interpolation=cv2.INTER_LANCZOS4)
-        bgr = cv2.cvtColor(up, cv2.COLOR_RGB2BGR)
-        ok, enc = cv2.imencode(
-            ".jpg",
-            bgr,
-            [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                96,
-                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR),
-                int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444),
-            ],
-        )
-        if ok:
-            dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-            if dec is not None:
-                return cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
-        return up
+        return _encode_decode_rgb(up, "jpeg_444", 96)
+
     if mode == "phone_isp":
         smooth = cv2.bilateralFilter(img, d=5, sigmaColor=18, sigmaSpace=18)
         blur = cv2.GaussianBlur(smooth, (0, 0), 1.1)
         sharp = cv2.addWeighted(smooth, 1.28, blur, -0.28, 0)
-        bgr = cv2.cvtColor(sharp, cv2.COLOR_RGB2BGR)
-        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        if ok:
-            dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-            if dec is not None:
-                return cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
-        return sharp
+        return _encode_decode_rgb(sharp, "jpeg_420", 90)
+
     if mode == "fft_hf_knockout":
         img_f = img.astype(np.float32) / 255.0
         fy = np.fft.fftfreq(h) * 2.0
@@ -514,33 +659,133 @@ def apply_eval_perturbation(img_rgb: np.ndarray, mode: str) -> np.ndarray:
     raise ValueError(f"Unknown perturbation mode: {mode}")
 
 
-class PairedForensicDataset(Dataset):
+class BalancedMultiGenPairDataset(Dataset):
     """
-    Pair-Synchronized Training Dataset:
-    Each item returns a matched (Real_k, AI_k) semantic pair processed through the EXACT same
-    random crop-offset, scale/interpolation, ISP, and codec augmentation pipeline.
-    When collated via `collate_paired_batch`, batch indices `0::2` are Real (0.0) and `1::2` are AI (1.0).
+    Multi-Generator & Internet-Laundered Stratified Pair Dataset (`ArtifactNet v5`):
+      - Pairs diverse Real camera domains (Pexels, LAION, MS-COCO, Smartphone VISION/Forchheim/IMD2020/FFHQ,
+        Reddit photography, Shutterstock) with stratified 11 AI Generator Families (65+ models).
+      - Caps legacy single-generator `legacy_train_v1` rows to <= 12% of epoch pairs so modern multi-generator
+        and internet-circulated corpora receive >= 88% of training capacity while rotating through 100% of data across epochs.
+      - Applies the EXACT same `sample_internet_laundering_params` pipeline to `(Real_k, AI_k)` in every pair,
+        eliminating compression, scale, messenger, and screenshot shortcuts!
     """
 
-    def __init__(self, df: pd.DataFrame, data_dir: Path, img_size: int = 256) -> None:
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        data_dir: Path,
+        img_size: int = 256,
+        pairs_per_epoch: int = 44000,
+        seed: int = 42,
+    ) -> None:
         self.data_dir = data_dir
         self.img_size = img_size
+        self.base_seed = seed
 
-        if "pair_id" in df.columns:
-            real_df = df[df["label"] == 0].set_index("pair_id")["file_name"]
-            ai_df = df[df["label"] == 1].set_index("pair_id")["file_name"]
-            common_pairs = real_df.index.intersection(ai_df.index)
-            self.real_files = real_df.loc[common_pairs].astype(str).tolist()
-            self.ai_files = ai_df.loc[common_pairs].astype(str).tolist()
+        work = df.copy()
+        if "family" not in work.columns:
+            work["family"] = np.where(work["label"].astype(int) == 0, 0, 11)
+        if "source_dataset" not in work.columns:
+            work["source_dataset"] = "multigen"
+
+        is_legacy = work["source_dataset"].astype(str) == "legacy_train_v1"
+        mod_df = work[~is_legacy]
+        leg_df = work[is_legacy]
+
+        # Modern Real buckets grouped by source_dataset so smartphone/COCO/Reddit/Pexels all get strong representation
+        self.mod_real_buckets: list[list[str]] = []
+        mod_real = mod_df[mod_df["label"] == 0]
+        if len(mod_real) > 0:
+            for _, grp in mod_real.groupby("source_dataset", sort=True):
+                files = grp["file_name"].astype(str).tolist()
+                if files:
+                    self.mod_real_buckets.append(files)
+
+        # Modern AI buckets grouped by generator family (1..11)
+        self.mod_ai_buckets: list[tuple[int, list[str]]] = []
+        mod_ai = mod_df[mod_df["label"] == 1]
+        if len(mod_ai) > 0:
+            for fam_id, grp in mod_ai.groupby("family", sort=True):
+                files = grp["file_name"].astype(str).tolist()
+                if files:
+                    self.mod_ai_buckets.append((int(fam_id), files))
+
+        self.leg_real_files = leg_df[leg_df["label"] == 0]["file_name"].astype(str).tolist()
+        self.leg_ai_files = leg_df[leg_df["label"] == 1]["file_name"].astype(str).tolist()
+
+        total_real = sum(len(b) for b in self.mod_real_buckets) + len(self.leg_real_files)
+        total_ai = sum(len(b[1]) for b in self.mod_ai_buckets) + len(self.leg_ai_files)
+        max_natural = max(1, min(total_real, total_ai))
+        self.pairs_per_epoch = pairs_per_epoch if pairs_per_epoch > 0 else max_natural
+
+        self.epoch_real: list[str] = []
+        self.epoch_ai: list[str] = []
+        self.epoch_ai_fam: list[int] = []
+        self.set_epoch(0)
+
+    def set_epoch(self, epoch: int) -> None:
+        rng = np.random.default_rng(self.base_seed + int(epoch) * 10007)
+        n_pairs = self.pairs_per_epoch
+
+        has_modern = len(self.mod_real_buckets) > 0 and len(self.mod_ai_buckets) > 0
+        has_legacy = len(self.leg_real_files) > 0 and len(self.leg_ai_files) > 0
+
+        if has_modern and has_legacy:
+            n_leg = min(int(round(n_pairs * 0.12)), len(self.leg_real_files), len(self.leg_ai_files))
+            n_mod = n_pairs - n_leg
+        elif has_modern:
+            n_mod, n_leg = n_pairs, 0
         else:
-            reals = df[df["label"] == 0]["file_name"].astype(str).tolist()
-            ais = df[df["label"] == 1]["file_name"].astype(str).tolist()
-            n = min(len(reals), len(ais))
-            self.real_files = reals[:n]
-            self.ai_files = ais[:n]
+            n_mod, n_leg = 0, n_pairs
+
+        real_out: list[str] = []
+        ai_out: list[str] = []
+        fam_out: list[int] = []
+
+        if n_mod > 0:
+            # Square-root damped bucket weights so smaller camera/generator families get boosted without extreme oversampling
+            r_weights = np.array([max(1.0, len(b) ** 0.65) for b in self.mod_real_buckets], dtype=np.float64)
+            r_weights /= r_weights.sum()
+            r_counts = rng.multinomial(n_mod, r_weights)
+            for b_files, cnt in zip(self.mod_real_buckets, r_counts):
+                if cnt <= 0:
+                    continue
+                idx = rng.choice(len(b_files), size=int(cnt), replace=(cnt > len(b_files)))
+                real_out.extend(b_files[i] for i in idx)
+
+            a_weights = np.array([max(1.0, len(b[1]) ** 0.65) for b in self.mod_ai_buckets], dtype=np.float64)
+            a_weights /= a_weights.sum()
+            a_counts = rng.multinomial(n_mod, a_weights)
+            for (fam_id, b_files), cnt in zip(self.mod_ai_buckets, a_counts):
+                if cnt <= 0:
+                    continue
+                idx = rng.choice(len(b_files), size=int(cnt), replace=(cnt > len(b_files)))
+                ai_out.extend(b_files[i] for i in idx)
+                fam_out.extend([fam_id] * int(cnt))
+
+            # Shuffle modern reals & modern AIs independently so every Real domain pairs with every AI family
+            perm_r = rng.permutation(len(real_out))
+            perm_a = rng.permutation(len(ai_out))
+            real_out = [real_out[i] for i in perm_r]
+            ai_out = [ai_out[i] for i in perm_a]
+            fam_out = [fam_out[i] for i in perm_a]
+
+        if n_leg > 0:
+            n_avail = min(len(self.leg_real_files), len(self.leg_ai_files))
+            l_idx = rng.choice(n_avail, size=n_leg, replace=(n_leg > n_avail))
+            for i in l_idx:
+                real_out.append(self.leg_real_files[int(i)])
+                ai_out.append(self.leg_ai_files[int(i)])
+                fam_out.append(11)
+
+        # Final shuffle across all pairs for the epoch
+        order = rng.permutation(len(real_out))
+        self.epoch_real = [real_out[i] for i in order]
+        self.epoch_ai = [ai_out[i] for i in order]
+        self.epoch_ai_fam = [fam_out[i] for i in order]
 
     def __len__(self) -> int:
-        return len(self.real_files)
+        return len(self.epoch_real)
 
     def _read_rgb(self, rel_path: str) -> np.ndarray:
         bgr = cv2.imread(str(self.data_dir / rel_path), cv2.IMREAD_COLOR)
@@ -549,16 +794,16 @@ class PairedForensicDataset(Dataset):
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     def __getitem__(self, idx: int):
-        # Worker-safe per-sample seed drawn from PyTorch's worker RNG (unique across workers & epochs)
         seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
         rng = np.random.default_rng(seed)
-        aug_cfg = sample_shared_aug_params(rng)
+        aug_cfg = sample_internet_laundering_params(rng)
 
-        raw_real = self._read_rgb(self.real_files[idx])
-        raw_ai = self._read_rgb(self.ai_files[idx])
+        raw_real = self._read_rgb(self.epoch_real[idx])
+        raw_ai = self._read_rgb(self.epoch_ai[idx])
+        ai_fam = self.epoch_ai_fam[idx]
 
-        aug_real = apply_shared_aug(raw_real, aug_cfg)
-        aug_ai = apply_shared_aug(raw_ai, aug_cfg)
+        aug_real = apply_internet_laundering(raw_real, aug_cfg)
+        aug_ai = apply_internet_laundering(raw_ai, aug_cfg)
 
         xg_r, xr_r, xp_r, _ = prepare_forensic_views(
             aug_real,
@@ -583,7 +828,16 @@ class PairedForensicDataset(Dataset):
         xr_pair = torch.from_numpy(np.stack([xr_r, xr_a], axis=0).transpose(0, 3, 1, 2))
         xp_pair = torch.from_numpy(np.stack([xp_r, xp_a], axis=0).transpose(0, 3, 1, 2))
         t_pair = torch.tensor([0.0, 1.0], dtype=torch.float32)
-        return xg_pair, xr_pair, xp_pair, t_pair
+        fam_pair = torch.tensor([0, int(ai_fam)], dtype=torch.long)
+        return xg_pair, xr_pair, xp_pair, t_pair, fam_pair
+
+
+class PairedForensicDataset(BalancedMultiGenPairDataset):
+    """Backward-compatible wrapper around BalancedMultiGenPairDataset."""
+
+    def __init__(self, df: pd.DataFrame, data_dir: Path, img_size: int = 256) -> None:
+        n_default = max(1, min(int((df["label"] == 0).sum()), int((df["label"] == 1).sum())))
+        super().__init__(df=df, data_dir=data_dir, img_size=img_size, pairs_per_epoch=n_default)
 
 
 def collate_paired_batch(batch):
@@ -591,11 +845,14 @@ def collate_paired_batch(batch):
     xr = torch.cat([item[1] for item in batch], dim=0)
     xp = torch.cat([item[2] for item in batch], dim=0)
     targets = torch.cat([item[3] for item in batch], dim=0)
+    if len(batch[0]) >= 5:
+        families = torch.cat([item[4] for item in batch], dim=0)
+        return xg, xr, xp, targets, families
     return xg, xr, xp, targets
 
 
 class SingleForensicDataset(Dataset):
-    """Deterministic Evaluation / Perturbation Dataset returning (x_global, x_rich, x_poor, target)."""
+    """Deterministic Evaluation / Perturbation Dataset returning (x_global, x_rich, x_poor, target[, family])."""
 
     def __init__(
         self,
@@ -604,13 +861,19 @@ class SingleForensicDataset(Dataset):
         img_size: int = 256,
         perturbation: str = "clean",
         return_global: bool = True,
+        return_family: bool = False,
     ) -> None:
         self.file_names = df["file_name"].astype(str).tolist()
         self.labels = df["label"].astype(np.float32).tolist()
+        if "family" in df.columns:
+            self.families = df["family"].fillna(0).astype(np.int64).tolist()
+        else:
+            self.families = [0 if lbl < 0.5 else 11 for lbl in self.labels]
         self.data_dir = data_dir
         self.img_size = img_size
         self.perturbation = perturbation
         self.return_global = return_global
+        self.return_family = return_family
 
     def __len__(self) -> int:
         return len(self.file_names)
@@ -636,13 +899,72 @@ class SingleForensicDataset(Dataset):
         xp = torch.from_numpy(np.ascontiguousarray(xp_np.transpose(2, 0, 1)))
         target = torch.tensor(label, dtype=torch.float32)
 
+        if self.return_family:
+            fam = torch.tensor(self.families[idx], dtype=torch.long)
+            if self.return_global:
+                return xg, xr, xp, target, fam
+            return xr, xp, target, fam
+
         if self.return_global:
             return xg, xr, xp, target
         return xr, xp, target
 
 
-# Backward-compatible alias
 ForensicPairDataset = SingleForensicDataset
+
+
+def create_dataloaders_v5(
+    data_dir: Path,
+    img_size: int = 256,
+    batch_size: int = 32,
+    samples_per_epoch: int = 88000,
+    num_workers: int = 8,
+    seed: int = 42,
+) -> tuple[BalancedMultiGenPairDataset, DataLoader, DataLoader, DataLoader, DataLoader]:
+    """
+    Creates v5 Multi-Generator + Unseen-OOD DataLoaders:
+      Returns (train_ds, train_loader, val_id_loader, val_ood_loader, test_ood_loader)
+    """
+    train_df, val_id_df, val_ood_df, test_ood_df = prepare_splits_v5(data_dir)
+    pair_batch_size = max(1, batch_size // 2)
+    pairs_per_epoch = max(pair_batch_size, samples_per_epoch // 2)
+
+    train_kw = dict(
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+        prefetch_factor=3 if num_workers > 0 else None,
+    )
+    eval_workers = max(2, num_workers // 2) if num_workers > 0 else 0
+    eval_kw = dict(
+        num_workers=eval_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=eval_workers > 0,
+        prefetch_factor=2 if eval_workers > 0 else None,
+    )
+
+    train_ds = BalancedMultiGenPairDataset(
+        train_df, data_dir, img_size=img_size, pairs_per_epoch=pairs_per_epoch, seed=seed
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=pair_batch_size,
+        shuffle=False,  # BalancedMultiGenPairDataset.set_epoch() performs stratified pair shuffling!
+        drop_last=True,
+        collate_fn=collate_paired_batch,
+        **train_kw,
+    )
+
+    val_id_ds = SingleForensicDataset(val_id_df, data_dir, img_size=img_size, return_global=True, return_family=True)
+    val_ood_ds = SingleForensicDataset(val_ood_df, data_dir, img_size=img_size, return_global=True, return_family=True)
+    test_ood_ds = SingleForensicDataset(test_ood_df, data_dir, img_size=img_size, return_global=True, return_family=True)
+
+    eval_bs = max(batch_size, 48)
+    val_id_loader = DataLoader(val_id_ds, batch_size=eval_bs, shuffle=False, **eval_kw)
+    val_ood_loader = DataLoader(val_ood_ds, batch_size=eval_bs, shuffle=False, **eval_kw)
+    test_ood_loader = DataLoader(test_ood_ds, batch_size=eval_bs, shuffle=False, **eval_kw)
+
+    return train_ds, train_loader, val_id_loader, val_ood_loader, test_ood_loader
 
 
 def create_dataloaders(
@@ -653,6 +975,7 @@ def create_dataloaders(
     return_global: bool = True,
     paired_train: bool = True,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
+    """Legacy single-dataset dataloader builder preserved for backward compatibility."""
     train_df, val_df, test_df = prepare_splits(data_dir)
 
     loader_kw = dict(

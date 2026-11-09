@@ -315,11 +315,11 @@ class SpectralRingDropout(nn.Module):
 
 class ScaleFreePhysicsExtractor(nn.Module):
     """
-    Scale-Free & Container-Resistant Physical Forensics Engine (Zero BatchNorm, Monochrome-Safe):
+    Scale-Free & Internet-Compression-Resilient Physical Forensics Engine (Zero BatchNorm, Monochrome-Safe):
     Produces:
       1. physics_maps: (B, 8, 256, 256) bounded spatial residual maps on x_global
-      2. physics_vec:  (B, 24) dimensionless ratios, correlations, log-slopes, and kurtoses
-                       compressed smoothly with asinh() so PNG/JPEG/monochrome inputs never drift.
+      2. physics_vec:  (B, 28) dimensionless ratios, correlations, log-slopes, kurtoses, and meso-scale
+                       compression-survivable descriptors compressed smoothly with asinh().
     """
 
     FEATURE_NAMES = [
@@ -347,6 +347,10 @@ class ScaleFreePhysicsExtractor(nn.Module):
         "Laplacian Excess Kurtosis",
         "2x2 Grid Diagonal Anisotropy",
         "Smooth-Region Residual Floor Ratio",
+        "8x8 Block Boundary/Interior Step Ratio",
+        "Meso-2x Rich/Poor Texture Log-Ratio",
+        "Meso-4x vs Fine-1x Edge Acutance Ratio",
+        "Radial Lens Center/Corner Sharpness Ratio",
     ]
 
     def __init__(self, img_size: int = 256) -> None:
@@ -606,6 +610,37 @@ class ScaleFreePhysicsExtractor(nn.Module):
             all_n = micro_noise.flatten(1).mean(dim=1, keepdim=True) + 1e-4
             smooth_floor_ratio = torch.log((smooth_n + 1e-4) / all_n)
 
+            # --- Compression-Survivable Meso-Scale & Optical Lens Descriptors (25..28) ---
+            # 25. 8x8 DCT Block Boundary vs Interior step ratio (explicit codec/recompression gauge)
+            dh_all = (gray[:, :, :, 1:] - gray[:, :, :, :-1]).abs()
+            dv_all = (gray[:, :, 1:, :] - gray[:, :, :-1, :]).abs()
+            bnd_h = dh_all[:, :, :, 7::8].mean(dim=(2, 3))
+            int_h = dh_all[:, :, :, 3::8].mean(dim=(2, 3)) + 1e-4
+            bnd_v = dv_all[:, :, 7::8, :].mean(dim=(2, 3))
+            int_v = dv_all[:, :, 3::8, :].mean(dim=(2, 3)) + 1e-4
+            block8_ratio = 0.5 * (torch.log((bnd_h + 1e-4) / int_h) + torch.log((bnd_v + 1e-4) / int_v))
+
+            # 26. Meso-2x Downsampled Rich/Poor Luma Log-Ratio (survives WhatsApp/WebP/2-hop resize)
+            yr_2x = F.avg_pool2d(yr, kernel_size=2, stride=2)
+            yp_2x = F.avg_pool2d(yp, kernel_size=2, stride=2)
+            meso_yr = F.conv2d(yr_2x, self.laplacian, padding=1).flatten(1).std(dim=1, keepdim=True) + 1e-4
+            meso_yp = F.conv2d(yp_2x, self.laplacian, padding=1).flatten(1).std(dim=1, keepdim=True) + 1e-4
+            meso_rp_log = torch.log(meso_yr / meso_yp)
+
+            # 27. Meso-4x vs Fine-1x Edge Acutance Consistency
+            gray_4x = F.avg_pool2d(gray, kernel_size=4, stride=4)
+            gx4 = F.conv2d(gray_4x, self.sobel_x, padding=1)
+            gy4 = F.conv2d(gray_4x, self.sobel_y, padding=1)
+            gmag4 = torch.sqrt(gx4 * gx4 + gy4 * gy4 + 1e-6)
+            meso_acutance = torch.log((gmag4.flatten(1).mean(dim=1, keepdim=True) + 1e-4) / grad_mean)
+
+            # 28. Radial Optical Center-vs-Corner Sharpness Ratio (real lens PSF falloff vs stationary AI kernel)
+            center_m = (rad < 0.50).to(torch.float32)
+            corner_m = (rad > 0.88).to(torch.float32)
+            c_sharp = (grad_mag * center_m).flatten(1).sum(dim=1, keepdim=True) / (center_m.sum() + 1.0) + 1e-4
+            k_sharp = (grad_mag * corner_m).flatten(1).sum(dim=1, keepdim=True) / (corner_m.sum() + 1.0) + 1e-4
+            radial_lens_ratio = torch.log(c_sharp / k_sharp)
+
             raw_vec = torch.cat(
                 [
                     m_std - 0.7,
@@ -632,6 +667,10 @@ class ScaleFreePhysicsExtractor(nn.Module):
                     lap_kurt,
                     grid_aniso * 3.0,
                     smooth_floor_ratio,
+                    block8_ratio * 2.0,
+                    meso_rp_log,
+                    meso_acutance,
+                    radial_lens_ratio,
                 ],
                 dim=1,
             )

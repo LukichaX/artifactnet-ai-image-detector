@@ -3,7 +3,6 @@ import os
 import random
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pandas as pd
 import torch
@@ -35,21 +34,22 @@ def seed_everything(seed: int = 42) -> None:
         torch.backends.cudnn.benchmark = True
 
 
-class ArtifactNetV4Loss(nn.Module):
+class ArtifactNetV5Loss(nn.Module):
     """
-    Unified 4-Objective Generalization Loss for From-Scratch Single-Dataset Forensics:
-    1. Smoothed Discriminative & Stream-Auxiliary BCE (prevents logit explosion).
-    2. Matched-Pair Twin Margin Ranking Loss (cancels scene semantics, scale, ISP, and codec shortcuts).
-    3. 8-Prototype Real-Camera Manifold Loss + Cross-Codec Real Variance Compactness (prevents unseen AI -> Real collapse).
-    4. Stream Gate Load-Balancing Regularization.
+    Unified 5-Objective Forensic Generalization Loss (`ArtifactNet v5`):
+      1. Smoothed Discriminative & 4-Stream Auxiliary BCE.
+      2. 12-Class Generator-Family Cross-Entropy + LogSumExp Union-of-Families Margin.
+      3. 16-Prototype Real-Camera Manifold Pull/Push (`d_min` separation prevents OOD collapse to Real).
+      4. Pair-Synchronized Internet-Laundered Twin Margin Ranking (`(Real_k, AI_k)` under identical 1/2-hop chains).
+      5. Stream Gate Load-Balancing Regularization.
     """
 
     def __init__(
         self,
         smoothing: float = 0.03,
-        pair_margin_logit: float = 2.4,
-        pair_margin_dist: float = 0.32,
-        manifold_push_margin: float = 0.36,
+        pair_margin_logit: float = 2.5,
+        pair_margin_dist: float = 0.34,
+        manifold_push_margin: float = 0.38,
     ) -> None:
         super().__init__()
         self.smoothing = smoothing
@@ -66,6 +66,7 @@ class ArtifactNetV4Loss(nn.Module):
         final_logit: torch.Tensor,
         details: dict,
         targets: torch.Tensor,
+        family_targets: torch.Tensor | None = None,
         paired_batch: bool = True,
     ) -> torch.Tensor:
         dev_type = "cuda" if final_logit.is_cuda else "cpu"
@@ -77,65 +78,79 @@ class ArtifactNetV4Loss(nn.Module):
             disc_logit = details["disc_logit"].to(torch.float32)
             raw_fused = details["raw_fused_logit"].to(torch.float32)
             manifold_logit = details["manifold_logit"].to(torch.float32)
-            d_real = details["d_real_train"].to(torch.float32)
+            d_min = details["d_real"].to(torch.float32)
+            d_train = details["d_real_train"].to(torch.float32)
             tau = details["manifold_tau"].to(torch.float32)
 
             # 1. Main + Per-Stream Auxiliary BCE
             loss_main = 0.50 * self._bce(raw_fused, t_col) + 0.50 * self._bce(disc_logit, t_col)
             loss_streams = sum(self._bce(details[k], t_col) for k in STREAM_KEYS) / len(STREAM_KEYS)
 
-            # 2. Multi-Prototype Real-Manifold Compactness & Separation (active from Step 1)
-            real_pull = is_real * (d_real.pow(2) + 2.0 * F.relu(d_real - tau).pow(2))
-            target_out = torch.clamp(tau.detach() + self.manifold_push_margin, min=0.42, max=1.15)
-            fake_push = is_fake * F.relu(target_out - d_real).pow(2)
+            # 2. 12-Family Multi-Generator Supervision + Union-of-AI Log-Odds BCE
+            loss_fam_bin = self._bce(details["family_ai_logit"], t_col)
+            if family_targets is not None and "family_logits" in details:
+                fam_t = family_targets.view(-1).to(torch.long)
+                loss_fam_ce = F.cross_entropy(
+                    details["family_logits"].to(torch.float32), fam_t, label_smoothing=0.04
+                )
+                loss_family = 0.65 * loss_fam_ce + 0.35 * loss_fam_bin
+            else:
+                loss_family = loss_fam_bin
+
+            # 3. 16-Prototype Real-Camera Manifold Pull (Real -> <= tau) & Push (AI d_min -> >= tau + margin)
+            real_pull = is_real * (d_train.pow(2) + 2.5 * F.relu(d_train - tau).pow(2))
+            target_out = torch.clamp(tau.detach() + self.manifold_push_margin, min=0.46, max=1.20)
+            # Push exact d_min so EVERY prototype stays well separated from synthetic embeddings!
+            fake_push = is_fake * F.relu(target_out - d_min).pow(2)
             loss_manifold_cal = self._bce(manifold_logit, t_col)
 
             real_mask_1d = t_col.squeeze(1) < 0.5
             if int(real_mask_1d.sum().item()) >= 4:
-                real_disp_var = d_real[real_mask_1d].var()
+                real_disp_var = d_min[real_mask_1d].var()
             else:
-                real_disp_var = torch.zeros((), device=d_real.device, dtype=torch.float32)
+                real_disp_var = torch.zeros((), device=d_min.device, dtype=torch.float32)
 
             loss_sphere = (
-                2.5 * torch.mean(real_pull + fake_push)
+                2.8 * torch.mean(real_pull + fake_push)
                 + 0.35 * loss_manifold_cal
-                + 1.5 * real_disp_var
+                + 1.4 * real_disp_var
             )
 
-            # 3. Matched-Pair Twin Ranking Loss (exact same scene + augmentation on (2k, 2k+1))
+            # 4. Pair-Synchronized Internet-Laundered Twin Margin Ranking
             bsz = t_col.shape[0]
             if paired_batch and bsz >= 2 and bsz % 2 == 0:
                 r_disc, a_disc = disc_logit[0::2], disc_logit[1::2]
-                r_dist, a_dist = d_real[0::2], d_real[1::2]
-                # Guard: verify pair labels actually alternate (0, 1)
+                r_dist, a_dist = d_min[0::2], d_min[1::2]
                 valid_pairs = ((t_col[0::2] < 0.5) & (t_col[1::2] >= 0.5)).to(torch.float32)
                 if valid_pairs.sum() > 0:
                     p_logit = F.softplus(self.pair_margin_logit - (a_disc - r_disc)) * valid_pairs
                     p_dist = F.softplus((self.pair_margin_dist - (a_dist - r_dist)) * 6.0) * valid_pairs
                     denom = valid_pairs.sum() + 1e-6
-                    loss_pair = 0.60 * (p_logit.sum() / denom) + 0.40 * (p_dist.sum() / denom)
+                    loss_pair = 0.55 * (p_logit.sum() / denom) + 0.45 * (p_dist.sum() / denom)
                 else:
-                    loss_pair = torch.zeros((), device=d_real.device, dtype=torch.float32)
+                    loss_pair = torch.zeros((), device=d_min.device, dtype=torch.float32)
             else:
-                loss_pair = torch.zeros((), device=d_real.device, dtype=torch.float32)
+                loss_pair = torch.zeros((), device=d_min.device, dtype=torch.float32)
 
-            # 4. Stream Gate Load-Balancing
+            # 5. Stream Gate Load-Balancing
             gate_mean = details["gate_weights"].to(torch.float32).mean(dim=0)
             target_gate = torch.full_like(gate_mean, 1.0 / len(STREAM_KEYS))
             loss_gate = F.mse_loss(gate_mean, target_gate)
 
             total = (
-                0.42 * loss_main
-                + 0.25 * loss_streams
-                + 0.18 * loss_sphere
+                0.30 * loss_main
+                + 0.18 * loss_streams
+                + 0.18 * loss_family
+                + 0.19 * loss_sphere
                 + 0.12 * loss_pair
                 + 0.03 * loss_gate
             )
             return total
 
 
-# Backward-compatible alias
-AsymmetricHypersphereLoss = ArtifactNetV4Loss
+# Backward-compatible aliases
+ArtifactNetV4Loss = ArtifactNetV5Loss
+AsymmetricHypersphereLoss = ArtifactNetV5Loss
 
 
 class ModelEMA:
@@ -180,14 +195,19 @@ def evaluate_perturbation_suite(
     df: pd.DataFrame,
     data_dir: Path,
     device: torch.device,
-    modes: tuple[str, ...] = ("upscale_1_8x", "downscale_0_68x_png", "jpeg_q96_444", "phone_isp"),
-    samples_per_mode: int = 300,
+    modes: tuple[str, ...] = (
+        "whatsapp_1hop",
+        "social_2hop_chain",
+        "webp_cdn_q75",
+        "screenshot_reencode",
+        "phone_isp",
+    ),
+    samples_per_mode: int = 360,
     batch_size: int = 64,
     num_workers: int = 4,
 ) -> dict[str, dict]:
     """
-    Evaluates the model across deterministic out-of-domain scale, compression, and ISP transforms.
-    Used both during training (to select the most generalizable checkpoint) and in final evaluation.
+    Evaluates the model across deterministic internet-laundering, messenger, screenshot, and ISP transforms.
     """
     model.eval()
     half = max(10, samples_per_mode // 2)
@@ -198,7 +218,7 @@ def evaluate_perturbation_suite(
             df0.sample(min(half, len(df0)), random_state=42),
             df1.sample(min(half, len(df1)), random_state=42),
         ],
-         ignore_index=True,
+        ignore_index=True,
     )
 
     results: dict[str, dict] = {}
@@ -221,8 +241,11 @@ def evaluate_perturbation_suite(
             xr = xr.to(device, non_blocking=True)
             xp = xp.to(device, non_blocking=True)
             with torch.amp.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=use_amp):
-                logits = model(xr, xp, x_global=xg)
-                probs = torch.sigmoid(logits.to(torch.float32)).squeeze(1)
+                logits, det = model(xr, xp, x_global=xg, return_details=True)
+                l_f32 = logits.to(torch.float32)
+                if det["stat_calibrated"]:
+                    l_f32 = 0.90 * l_f32 + 0.10 * det["stat_logit"].to(torch.float32)
+                probs = torch.sigmoid(l_f32).squeeze(1)
             ys.extend(targets.numpy())
             ps.extend(probs.cpu().numpy())
 
@@ -240,33 +263,58 @@ def fit_post_training_calibration(
     val_df: pd.DataFrame,
     data_dir: Path,
     device: torch.device,
-    samples_per_cond: int = 500,
+    val_ood_df: pd.DataFrame | None = None,
+    samples_per_cond: int = 600,
     batch_size: int = 64,
     num_workers: int = 4,
 ) -> dict:
     """
-    Post-Training Multi-Condition Calibration (Zero External Data!):
-    Evaluates validation samples across 5 conditions (clean + 4 OOD format/scale/ISP transforms) to:
-      1. Fit L2-regularized LogisticRegression weights for the 24 dimensionless physics features
-         (so every ForensicCouncil indicator has data-verified direction & calibration).
-      2. Optimize `(blend_alpha, calib_temp, calib_bias)` so `threshold = 0.50` achieves balanced
-         Real Specificity & AI Recall with honest probability calibration across codecs & scales.
-    Writes calibrated buffers directly into `model` (saved inside `best_model.pth`).
+    Post-Training Unseen-Generator & Multi-Hop Internet Calibration (`ArtifactNet v5`):
+    Jointly evaluates in-distribution AND strictly held-out unseen-generator (`val_ood_df`) samples across
+    6 real-world delivery conditions (`clean`, `whatsapp_1hop`, `social_2hop_chain`, `webp_cdn_q75`,
+    `screenshot_reencode`, `phone_isp`) to:
+      1. Fit L2-regularized LogisticRegression weights for the 28 dimensionless + meso-scale physics ratios.
+      2. Optimize `(blend_alpha, calib_temp, calib_bias)` with `blend_alpha >= 0.24` so the 16-Prototype
+         Real-Camera Manifold stays active and `threshold = 0.50` achieves balanced Real Specificity & AI Recall
+         on both clean and compressed/forwarded internet images!
     """
     model.eval()
-    conditions = ("clean", "upscale_1_8x", "downscale_0_68x_png", "jpeg_q96_444", "phone_isp")
-    half = max(20, samples_per_cond // 2)
-    df0 = val_df[val_df["label"] == 0]
-    df1 = val_df[val_df["label"] == 1]
-    sub_df = pd.concat(
-        [
-            df0.sample(min(half, len(df0)), random_state=123),
-            df1.sample(min(half, len(df1)), random_state=123),
-        ],
-        ignore_index=True,
+    conditions = (
+        "clean",
+        "whatsapp_1hop",
+        "social_2hop_chain",
+        "webp_cdn_q75",
+        "screenshot_reencode",
+        "phone_isp",
     )
 
-    disc_list, man_list, phys_list, y_list = [], [], [], []
+    # Combine 40% val_id + 60% val_ood (when available) so unseen generators & internet posts anchor the threshold!
+    if val_ood_df is not None and len(val_ood_df) >= 40:
+        n_id_half = max(20, int(samples_per_cond * 0.20))
+        n_ood_half = max(20, int(samples_per_cond * 0.30))
+        id0, id1 = val_df[val_df["label"] == 0], val_df[val_df["label"] == 1]
+        od0, od1 = val_ood_df[val_ood_df["label"] == 0], val_ood_df[val_ood_df["label"] == 1]
+        sub_df = pd.concat(
+            [
+                id0.sample(min(n_id_half, len(id0)), random_state=123),
+                id1.sample(min(n_id_half, len(id1)), random_state=123),
+                od0.sample(min(n_ood_half, len(od0)), random_state=456),
+                od1.sample(min(n_ood_half, len(od1)), random_state=456),
+            ],
+            ignore_index=True,
+        )
+    else:
+        half = max(20, samples_per_cond // 2)
+        df0, df1 = val_df[val_df["label"] == 0], val_df[val_df["label"] == 1]
+        sub_df = pd.concat(
+            [
+                df0.sample(min(half, len(df0)), random_state=123),
+                df1.sample(min(half, len(df1)), random_state=123),
+            ],
+            ignore_index=True,
+        )
+
+    disc_list, d_real_list, phys_list, y_list = [], [], [], []
     dev_type = "cuda" if device.type == "cuda" else "cpu"
     use_amp = device.type == "cuda"
 
@@ -287,36 +335,49 @@ def fit_post_training_calibration(
                 with torch.amp.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=use_amp):
                     _, det = model(xr, xp, x_global=xg, return_details=True)
                 disc_list.append(det["disc_logit"].to(torch.float32).cpu())
-                man_list.append(det["manifold_logit"].to(torch.float32).cpu())
+                d_real_list.append(det["d_real"].to(torch.float32).cpu())
                 phys_list.append(det["physics_vec"].to(torch.float32).cpu())
                 y_list.append(targets.view(-1, 1).to(torch.float32).cpu())
 
-    disc_all = torch.cat(disc_list, dim=0)  # (N, 1)
-    man_all = torch.cat(man_list, dim=0)    # (N, 1)
-    phys_all = torch.cat(phys_list, dim=0)  # (N, 24)
-    y_all = torch.cat(y_list, dim=0)        # (N, 1)
+    disc_all = torch.cat(disc_list, dim=0)
+    d_real_all = torch.cat(d_real_list, dim=0)
+    phys_all = torch.cat(phys_list, dim=0)
+    y_all = torch.cat(y_list, dim=0)
     y_np = y_all.squeeze(1).numpy().astype(int)
 
-    # 1. Fit L2-regularized Logistic Model on 24 dimensionless statistical descriptors
+    # Align 16-Prototype Real-Camera Manifold boundary (tau) & slope (m_scale) to empirical d_real distribution!
+    with torch.no_grad():
+        d_np = d_real_all.squeeze(1).numpy()
+        r_med = float(np.percentile(d_np[y_np == 0], 68)) if np.any(y_np == 0) else 0.03
+        a_med = float(np.percentile(d_np[y_np == 1], 38)) if np.any(y_np == 1) else 0.06
+        emp_tau = float(np.clip(0.5 * (r_med + a_med), 0.012, 0.80))
+        d_iqr = max(1e-3, float(np.percentile(d_np, 80) - np.percentile(d_np, 20)))
+        disc_iqr = max(0.5, float(np.percentile(disc_all.numpy(), 80) - np.percentile(disc_all.numpy(), 20)))
+        emp_scale = float(np.clip(disc_iqr / d_iqr, 2.5, 55.0))
+        model.manifold_tau.fill_(emp_tau)
+        model.manifold_log_scale.fill_(float(np.log(emp_scale)))
+        man_all = emp_scale * (d_real_all - emp_tau)
+
+    # 1. Fit L2-regularized Logistic Model on 28 dimensionless + meso-scale statistical descriptors
     clf = LogisticRegression(C=0.5, max_iter=1000, solver="lbfgs")
     clf.fit(phys_all.numpy(), y_np)
     stat_probs = clf.predict_proba(phys_all.numpy())[:, 1]
-    stat_auc = float(roc_auc_score(y_np, stat_probs))
+    stat_auc = float(roc_auc_score(y_np, stat_probs)) if len(np.unique(y_np)) > 1 else 0.5
 
     with torch.no_grad():
         model.stat_weights.copy_(torch.from_numpy(clf.coef_[0].astype(np.float32)).to(device))
         model.stat_bias.copy_(torch.from_numpy(clf.intercept_.astype(np.float32)).to(device))
         model.stat_calibrated.fill_(True)
 
-    # 2. Grid-search blend_alpha + optimize Platt/Temperature scaling (calib_temp, calib_bias)
+    # 2. Grid-search blend_alpha in [0.24, 0.56] + optimize Platt/Temperature scaling (calib_temp, calib_bias)
     best_obj = float("inf")
-    best_params = (0.35, 1.0, 0.0)
+    best_params = (0.34, 1.0, 0.0)
 
-    for alpha_cand in np.linspace(0.15, 0.60, 10):
+    for alpha_cand in np.linspace(0.24, 0.56, 9):
         raw_comb = (1.0 - float(alpha_cand)) * disc_all + float(alpha_cand) * man_all
         log_temp = torch.zeros(1, dtype=torch.float32, requires_grad=True)
         bias = torch.zeros(1, dtype=torch.float32, requires_grad=True)
-        opt = torch.optim.LBFGS([log_temp, bias], lr=0.25, max_iter=60)
+        opt = torch.optim.LBFGS([log_temp, bias], lr=0.25, max_iter=70)
 
         def _closure():
             opt.zero_grad()
@@ -336,9 +397,8 @@ def fit_post_training_calibration(
             nll = float(F.binary_cross_entropy_with_logits(cal_logits, y_all).item())
             probs = torch.sigmoid(cal_logits).squeeze(1).numpy()
             m = compute_metrics(y_np, probs)
-            # Balance NLL calibration with high F1 and balanced specificity/recall
-            balance_pen = abs(m["specificity"] - m["recall"]) * 0.15
-            obj = nll - 0.25 * m["f1"] + balance_pen
+            balance_pen = abs(m["specificity"] - m["recall"]) * 0.22
+            obj = nll - 0.30 * m["f1"] + balance_pen
             if obj < best_obj:
                 best_obj = obj
                 best_params = (float(alpha_cand), t_val, b_val)

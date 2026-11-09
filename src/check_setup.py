@@ -1,4 +1,4 @@
-import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -10,16 +10,18 @@ import pandas as pd
 import torch
 from PIL import Image
 
-from src.model import ArtifactNetV4
+from src.model import ArtifactNetV5
 
 
 def main() -> None:
-    print("=" * 64)
-    print("1. GPU, CUDA & BFloat16 Environment Verification")
-    print("=" * 64)
+    print("=" * 68)
+    print("1. GPU, CUDA, Disk & ArtifactNet v5 Verification")
+    print("=" * 68)
     print(f"Python version   : {sys.version.split()[0]}")
     print(f"PyTorch version  : {torch.__version__}")
     print(f"CUDA available   : {torch.cuda.is_available()}")
+    free_c_gb = shutil.disk_usage("C:\\").free / (1024 ** 3)
+    print(f"Free Space on C: : {free_c_gb:.2f} GB")
 
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
@@ -31,25 +33,35 @@ def main() -> None:
     else:
         print("WARNING: CUDA is not available. Training on CPU will be very slow.")
 
-    model = ArtifactNetV4()
+    model = ArtifactNetV5()
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"ArtifactNet v4   : {n_params:,} trainable parameters (100% From Scratch)")
+    print(f"ArtifactNet v5   : {n_params:,} trainable parameters (100% From Scratch)")
 
-    print("\n" + "=" * 64)
-    print("2. Dataset & Pair-Aware Split Verification")
-    print("=" * 64)
+    print("\n" + "=" * 68)
+    print("2. Multi-Generator & Original Dataset Split Verification")
+    print("=" * 68)
 
     data_dir = PROJECT_ROOT / "data"
-    train_csv = data_dir / "train.csv"
+    splits_v5 = data_dir / "splits_v5"
+    if (splits_v5 / "train_split.csv").exists():
+        tr = pd.read_csv(splits_v5 / "train_split.csv")
+        vid = pd.read_csv(splits_v5 / "val_id_split.csv")
+        vod = pd.read_csv(splits_v5 / "val_ood_split.csv")
+        tod = pd.read_csv(splits_v5 / "test_ood_split.csv")
+        print(f"v5 Train Split   : {len(tr):,} rows (Real={(tr['label']==0).sum():,}, AI={(tr['label']==1).sum():,})")
+        print(f"v5 Val-ID Split  : {len(vid):,} rows")
+        print(f"v5 Val-OOD Split : {len(vod):,} rows (Unseen Generators & Reddit)")
+        print(f"v5 Test-OOD Split: {len(tod):,} rows (Unseen Generators & Reddit)")
+        sample_df = tr
+    else:
+        train_csv = data_dir / "train.csv"
+        if not train_csv.exists():
+            print(f"ERROR: Could not find {train_csv}")
+            return
+        sample_df = pd.read_csv(train_csv)
+        print(f"Loaded train.csv : {len(sample_df):,} rows (run `python src/harvest_dataset.py` to build splits_v5)")
 
-    if not train_csv.exists():
-        print(f"ERROR: Could not find {train_csv}")
-        return
-
-    df = pd.read_csv(train_csv)
-    print(f"Loaded train.csv : {len(df):,} rows ({len(df)//2:,} matched Real/AI pairs)")
-
-    sample_paths = df["file_name"].sample(min(200, len(df)), random_state=42).tolist()
+    sample_paths = sample_df["file_name"].sample(min(200, len(sample_df)), random_state=42).tolist()
     missing = 0
     sizes = []
     for rel_path in sample_paths:
@@ -60,14 +72,14 @@ def main() -> None:
             with Image.open(img_path) as img:
                 sizes.append(img.size)
 
-    if missing == 0:
+    if missing == 0 and sizes:
         widths = [s[0] for s in sizes]
         heights = [s[1] for s in sizes]
-        print("Sample integrity : 200/200 sampled images verified on disk")
+        print(f"Sample integrity : {len(sizes)}/{len(sizes)} sampled images verified on disk")
         print(f"Width range      : min={min(widths)}px, max={max(widths)}px")
         print(f"Height range     : min={min(heights)}px, max={max(heights)}px")
     else:
-        print(f"ERROR: {missing}/200 sampled images missing under {data_dir}")
+        print(f"ERROR: {missing}/{len(sample_paths)} sampled images missing under {data_dir}")
 
 
 if __name__ == "__main__":
